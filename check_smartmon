@@ -21,14 +21,16 @@
 #   with this program; if not, write to the Free Software Foundation, Inc.,
 #   51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 
+# patches for FreeBSD and SCSI disks: wtps0n@bsdserwis.com
 
 """Package versioning
 """
 
 
 import os.path
-import sys
+import sys, re
 
+from subprocess import Popen,PIPE
 from optparse import OptionParser
 
 
@@ -56,6 +58,8 @@ def parseCmdLine(args):
                         dest="verbosity", type="int", default=0,
                         metavar="LEVEL", help="set verbosity level to LEVEL; defaults to 0 (quiet), \
                                         possible values go up to 3")
+        parser.add_option("-t", "--type", action="store", dest="devtype", default="ata", metavar="DEVTYPE",
+                        help="type of device (ATA|SCSI)")
         parser.add_option("-w", "--warning-threshold", metavar="TEMP", action="store",
                         type="int", dest="warningThreshold", default=55,
                         help="set temperature warning threshold to given temperature (defaults to 55)")
@@ -111,7 +115,8 @@ def callSmartMonTools(path, device):
         # get health status
         cmd = "%s -H %s" % (path, device)
         vprint(3, "Get device health status: %s" % cmd)
-        (child_stdin, child_stdout, child_stderr) = os.popen3(cmd)
+        p = Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE)
+        (child_stdout, child_stderr) = (p.stdout, p.stderr)
         line = child_stderr.readline()
         if len(line):
                 return (3, "UNKNOWN: call exits unexpectedly (%s)" % line, "",
@@ -124,7 +129,8 @@ def callSmartMonTools(path, device):
         # get temperature
         cmd = "%s -A %s" % (path, device)
         vprint(3, "Get device temperature: %s" % cmd)
-        (child_stdin, child_stdout, child_stderr) = os.popen3(cmd)
+        p = Popen(cmd, shell=True, stdout=PIPE, stderr=PIPE)
+        (child_stdout, child_stderr) = (p.stdout, p.stderr)
         line = child_stderr.readline()
         if len(line):
                 return (3, "UNKNOWN: call exits unexpectedly (%s)" % line, "",
@@ -139,56 +145,86 @@ def callSmartMonTools(path, device):
 # end
 
 
-def parseOutput(healthMessage, temperatureMessage):
+def parseOutput(healthMessage, temperatureMessage, devType):
         """Parse smartctl output
 
         Returns (health status, temperature).
         """
 
-        # parse health status
-        #
-        # look for line '=== START OF READ SMART DATA SECTION ==='
-        statusLine = ""
-        lines = healthMessage.split("\n")
-        getNext = 0
-        for line in lines:
-                if getNext:
-                        statusLine = line
-                        break
-                elif line == "=== START OF READ SMART DATA SECTION ===":
-                        getNext = 1
-                # fi
-        # done
-        parts = statusLine.split()
-        healthStatus = parts[-1]
-        vprint(3, "Health status: %s" % healthStatus)
+        vprint(3, "parseOutput: Device type is %s" % devType)
 
-
-        # parse temperature attribute line
-        temperature = 0
-        lines = temperatureMessage.split("\n")
-        for line in lines:
-                parts = line.split()
-                if len(parts):
-                        # 194 is the temperature value id
-                        if parts[0] == "194":
-                                temperature = int(parts[9])
+        if devType == "ata":
+                # parse health status
+                #
+                # look for line '=== START OF READ SMART DATA SECTION ==='
+                statusLine = ""
+                lines = healthMessage.split("\n")
+                getNext = 0
+                for line in lines:
+                        if getNext:
+                                statusLine = line
                                 break
+                        elif line == "=== START OF READ SMART DATA SECTION ===":
+                                getNext = 1
                         # fi
+                # done
+        
+                if getNext:
+                        parts = statusLine.split()
+                        healthStatus = parts[-1]
                 # fi
-        # done
+        
+                # parse temperature attribute line
+                temperature = 0
+                lines = temperatureMessage.split("\n")
+                for line in lines:
+                        parts = line.split()
+                        if len(parts):
+                                # 194 is the temperature value id
+                                if parts[0] == "194":
+                                        temperature = int(parts[9])
+                                        break
+                                # fi
+                        # fi
+                # done
+        # if devType == ata
+
+        if devType == "scsi":
+                stat_re = re.compile( r'SMART Health Status:' )
+                lines = healthMessage.split("\n")
+                for line in lines:
+                        if stat_re.search( line ):
+                               parts = line.split()
+                               healthStatus = parts[-1]
+                               break
+                       # fi
+                # done
+
+                # get temperature from temperatureMessage
+                stat_re = re.compile( r'Current Drive Temperature:' )
+                lines = temperatureMessage.split("\n")
+                for line in lines:
+                        if stat_re.search( line ):
+                               parts = line.split()
+                               temperature = int(parts[-2])
+                               break
+                       # fi
+                # done
+                                
+        # if devType == scsi
+
+	vprint(3, "Health status: %s" % healthStatus)
         vprint(3, "Temperature: %d" %temperature)
 
         return (healthStatus, temperature)
 # end
-
 
 def createReturnInfo(healthStatus, temperature, warningThreshold,
                 criticalThreshold):
         """Create return information according to given thresholds."""
 
         # this is absolutely critical!
-        if healthStatus != "PASSED":
+        if healthStatus not in [ "PASSED", "OK" ]:
                 return (2, "CRITICAL: device does not pass health status")
         # fi
 
@@ -245,13 +281,27 @@ if __name__ == "__main__":
         # fi
         vprint(1, "Path to smartctl: %s" % _smartctlPath)
 
+        # FreeBSD specific - SCSI disks are /dev/da[0-9]
+        device_re = re.compile( r'/dev/da[0-9]' )
+
+        # check device type, ATA is default
+        vprint(2, "Get device type")
+        devtype = options.devtype
+        if not devtype:
+                devtype = "ATA"
+
+        if device_re.search( device ):
+                devtype = "scsi"
+
+        vprint(1, "Device type: %s" % devtype)
+
         # call smartctl and parse output
         vprint(2, "Call smartctl")
         (value, message, healthStatusOutput, temperatureOutput) = callSmartMonTools(_smartctlPath, device)
         if value != 0:
                 exitWithMessage(value, message)
         vprint(2, "Parse smartctl output")
-        (healthStatus, temperature) = parseOutput(healthStatusOutput, temperatureOutput)
+        (healthStatus, temperature) = parseOutput(healthStatusOutput, temperatureOutput, devtype)
         vprint(2, "Generate return information")
         (value, message) = createReturnInfo(healthStatus, temperature,
                         options.warningThreshold, options.criticalThreshold)
